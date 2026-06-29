@@ -25,6 +25,8 @@ const T = {
 const AI_RETRY_MESSAGE =
   "Gemini is busy or rate-limiting requests right now. Give it a moment, then send your last message again.";
 const STORAGE_KEY = "deeptutor-state-v1";
+const STATE_ENDPOINT = "/api/state";
+const SYNC_INTERVAL_MS = 5000;
 
 const makeId = (prefix) =>
   `${prefix}${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
@@ -44,6 +46,79 @@ const emptySession = () => ({
   currentArticleIndex: 0,
 });
 
+const sharedDb = {
+  normalize(data) {
+    return {
+      accounts: Array.isArray(data?.accounts) ? data.accounts : [],
+      articles: Array.isArray(data?.articles) ? data.articles : SEED,
+      sessions: data?.sessions && typeof data.sessions === "object" ? data.sessions : {},
+    };
+  },
+  read() {
+    try {
+      return this.normalize(JSON.parse(localStorage.getItem(STORAGE_KEY)));
+    } catch {
+      return this.normalize(null);
+    }
+  },
+  write(data) {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(this.normalize(data)));
+  },
+  async load() {
+    try {
+      const response = await fetch(STATE_ENDPOINT, {
+        headers: { Accept: "application/json" },
+        cache: "no-store",
+      });
+      if (!response.ok) throw new Error("Shared state unavailable");
+      const state = this.normalize(await response.json());
+      this.write(state);
+      return state;
+    } catch {
+      return this.read();
+    }
+  },
+  async save(data) {
+    const state = this.normalize(data);
+    this.write(state);
+    try {
+      const response = await fetch(STATE_ENDPOINT, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(state),
+      });
+      if (!response.ok) throw new Error("Shared state save failed");
+    } catch {
+      // Keep the local copy so the app still works without the shared API.
+    }
+  },
+  createAccount(state, data, { makeSession = false } = {}) {
+    const account = {
+      id: makeId(data.role === "student" ? "s" : "p"),
+      name: data.name,
+      role: data.role,
+      createdAt: new Date().toISOString(),
+    };
+    const next = {
+      ...state,
+      accounts: [...state.accounts, account],
+      sessions: makeSession
+        ? { ...state.sessions, [account.id]: emptySession() }
+        : state.sessions,
+    };
+    return { account, state: next };
+  },
+  updateSession(state, id, data) {
+    return {
+      ...state,
+      sessions: {
+        ...state.sessions,
+        [id]: { ...(state.sessions[id] || emptySession()), ...data },
+      },
+    };
+  },
+};
+
 // ── Seed articles ──────────────────────────────────────────
 const SEED = [];
 
@@ -51,7 +126,7 @@ const SEED = [];
 function toGeminiContents(messages) {
   return messages.map((m) => ({
     role: m.role === "assistant" ? "model" : "user",
-    parts: [{ text: m.content }],
+    parts: m.parts || [{ text: m.content }],
   }));
 }
 
@@ -128,6 +203,44 @@ async function fetchArticleFromURL(url) {
   return text;
 }
 
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || "");
+      resolve(result.includes(",") ? result.split(",")[1] : result);
+    };
+    reader.onerror = () => reject(reader.error || new Error("File read failed"));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function extractArticleFromPDF(file) {
+  const data = await fileToBase64(file);
+  const text = await callAI(
+    [
+      {
+        role: "user",
+        parts: [
+          {
+            text: "Extract the complete readable article text from this PDF. Include all substantive content in clean markdown. Do not include page numbers, headers, footers, or repeated boilerplate unless they are part of the article.",
+          },
+          {
+            inlineData: {
+              mimeType: file.type || "application/pdf",
+              data,
+            },
+          },
+        ],
+      },
+    ],
+    "You are a PDF content extractor. Return only the article body in clean readable markdown.",
+    { maxOutputTokens: 6000 },
+  );
+  if (!text) throw new Error("No PDF content extracted");
+  return text;
+}
+
 async function suggestConceptsFromContent(content) {
   const r = await callAI(
     [
@@ -142,6 +255,19 @@ async function suggestConceptsFromContent(content) {
 }
 
 // ── EVAL parsing ───────────────────────────────────────────
+async function suggestGoalFromContent(content) {
+  const r = await callAI(
+    [
+      {
+        role: "user",
+        content: `Write one concise learning goal for a student reading this article. Return ONLY the goal sentence, nothing else:\n\n${content.slice(0, 2500)}`,
+      },
+    ],
+    "You write clear, student-facing learning goals for educational articles. Return one concise sentence only.",
+  );
+  return r.trim().replace(/^["']|["']$/g, "");
+}
+
 function parseEval(text) {
   try {
     const m = text.match(/EVAL:\s*(\{[^{}]*\})/);
@@ -778,11 +904,13 @@ function Professor({ articles, setArticles, sessions, students, onAddStudent }) 
     concepts: "",
     content: "",
     url: "",
+    pdfName: "",
   });
   const [flashId, setFlashId] = useState(null);
   const [picked, setPicked] = useState(null);
   const [studentName, setStudentName] = useState("");
   const [fetching, setFetching] = useState(false);
+  const [readingPdf, setReadingPdf] = useState(false);
   const [fetchMsg, setFetchMsg] = useState(null); // { type:"ok"|"err", text }
   const chatEndRef = useRef();
 
@@ -791,12 +919,31 @@ function Professor({ articles, setArticles, sessions, students, onAddStudent }) 
   }, [sessions, picked]);
 
   const F = (k, v) => setForm((f) => ({ ...f, [k]: v }));
+  const parsedConcepts = [
+    ...new Set(
+      form.concepts
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
+    ),
+  ];
+  const canPublish =
+    form.title.trim() &&
+    form.goal.trim() &&
+    form.content.trim() &&
+    parsedConcepts.length > 0 &&
+    !fetching &&
+    !readingPdf;
 
   const addStudent = () => {
     if (!studentName.trim()) return;
     const student = onAddStudent(studentName.trim());
     setPicked(student.id);
     setStudentName("");
+  };
+
+  const removeArticle = (id) => {
+    setArticles((prev) => prev.filter((article) => article.id !== id));
   };
 
   const handleFetch = async () => {
@@ -806,7 +953,12 @@ function Professor({ articles, setArticles, sessions, students, onAddStudent }) 
     try {
       const content = await fetchArticleFromURL(form.url.trim());
       F("content", content);
+      F("pdfName", "");
       setFetchMsg({ type: "ok", text: "Article fetched successfully." });
+      if (!form.goal.trim()) {
+        const goal = await suggestGoalFromContent(content);
+        if (goal) F("goal", goal);
+      }
       // auto-suggest concepts if field is empty
       if (!form.concepts.trim()) {
         const sugg = await suggestConceptsFromContent(content);
@@ -821,31 +973,75 @@ function Professor({ articles, setArticles, sessions, students, onAddStudent }) 
     setFetching(false);
   };
 
+  const handlePdf = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+
+    if (file.type && file.type !== "application/pdf") {
+      setFetchMsg({ type: "err", text: "Please choose a PDF file." });
+      return;
+    }
+
+    setReadingPdf(true);
+    setFetchMsg(null);
+    try {
+      const content = await extractArticleFromPDF(file);
+      F("content", content);
+      F("url", "");
+      F("pdfName", file.name);
+      if (!form.title.trim()) {
+        F("title", file.name.replace(/\.pdf$/i, "").trim());
+      }
+      setFetchMsg({ type: "ok", text: "PDF read successfully." });
+      if (!form.goal.trim()) {
+        const goal = await suggestGoalFromContent(content);
+        if (goal) F("goal", goal);
+      }
+      if (!form.concepts.trim()) {
+        const sugg = await suggestConceptsFromContent(content);
+        if (sugg) F("concepts", sugg);
+      }
+    } catch {
+      setFetchMsg({
+        type: "err",
+        text: "Couldn't read that PDF. Try copying the text into the content box.",
+      });
+    }
+    setReadingPdf(false);
+  };
+
   const publish = () => {
-    if (!form.title.trim() || !form.content.trim()) return;
+    if (!canPublish) {
+      setFetchMsg({
+        type: "err",
+        text: "Add a title, goal, content, and at least one concept before publishing.",
+      });
+      return;
+    }
     const id = "a" + Date.now();
-    const concepts = [
-      ...new Set(
-        form.concepts
-          .split(",")
-          .map((s) => s.trim())
-          .filter(Boolean),
-      ),
-    ];
     setArticles((p) => [
       ...p,
       {
         id,
         title: form.title.trim(),
         goal: form.goal.trim(),
-        concepts,
+        concepts: parsedConcepts,
         content: form.content.trim(),
         url: form.url.trim(),
+        pdfName: form.pdfName.trim(),
       },
     ]);
     setFlashId(id);
     setTimeout(() => setFlashId(null), 3500);
-    setForm({ title: "", goal: "", concepts: "", content: "", url: "" });
+    setForm({
+      title: "",
+      goal: "",
+      concepts: "",
+      content: "",
+      url: "",
+      pdfName: "",
+    });
     setFetchMsg(null);
   };
 
@@ -1041,6 +1237,22 @@ function Professor({ articles, setArticles, sessions, students, onAddStudent }) 
                             Live
                           </span>
                         )}
+                        <button
+                          type="button"
+                          onClick={() => removeArticle(a.id)}
+                          style={{
+                            background: "transparent",
+                            border: `1px solid ${T.border}`,
+                            borderRadius: 5,
+                            color: T.sub,
+                            cursor: "pointer",
+                            fontSize: 11,
+                            padding: "1px 8px",
+                            fontFamily: "inherit",
+                          }}
+                        >
+                          Remove
+                        </button>
                       </div>
                       {a.goal && (
                         <div
@@ -1127,7 +1339,7 @@ function Professor({ articles, setArticles, sessions, students, onAddStudent }) 
                   />
                   <button
                     onClick={handleFetch}
-                    disabled={!form.url.trim() || fetching}
+                    disabled={!form.url.trim() || fetching || readingPdf}
                     style={{
                       background: T.accent,
                       border: "none",
@@ -1137,7 +1349,7 @@ function Professor({ articles, setArticles, sessions, students, onAddStudent }) 
                       fontSize: 13,
                       fontWeight: 500,
                       cursor: fetching ? "wait" : "pointer",
-                      opacity: !form.url.trim() || fetching ? 0.5 : 1,
+                      opacity: !form.url.trim() || fetching || readingPdf ? 0.5 : 1,
                       fontFamily: "inherit",
                       whiteSpace: "nowrap",
                       flexShrink: 0,
@@ -1146,6 +1358,37 @@ function Professor({ articles, setArticles, sessions, students, onAddStudent }) 
                     {fetching ? "Fetching…" : "Fetch article"}
                   </button>
                 </div>
+                <label
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: 12,
+                    background: T.panel,
+                    border: `1px solid ${T.border}`,
+                    borderRadius: 8,
+                    padding: "9px 13px",
+                    color: readingPdf || fetching ? T.sub : T.text,
+                    fontSize: 13,
+                    cursor: readingPdf || fetching ? "wait" : "pointer",
+                  }}
+                >
+                  <span>
+                    {readingPdf
+                      ? "Reading PDF..."
+                      : "No URL? Upload a PDF to extract article text"}
+                  </span>
+                  <span style={{ color: T.acL, whiteSpace: "nowrap" }}>
+                    Choose PDF
+                  </span>
+                  <input
+                    type="file"
+                    accept="application/pdf,.pdf"
+                    onChange={handlePdf}
+                    disabled={readingPdf || fetching}
+                    style={{ display: "none" }}
+                  />
+                </label>
                 {fetchMsg && (
                   <div
                     style={{
@@ -1173,6 +1416,7 @@ function Professor({ articles, setArticles, sessions, students, onAddStudent }) 
                 <div>
                   <button
                     onClick={publish}
+                    disabled={!canPublish}
                     style={{
                       background: T.accent,
                       border: "none",
@@ -1181,8 +1425,9 @@ function Professor({ articles, setArticles, sessions, students, onAddStudent }) 
                       color: "#fff",
                       fontSize: 14,
                       fontWeight: 500,
-                      cursor: "pointer",
+                      cursor: canPublish ? "pointer" : "default",
                       fontFamily: "inherit",
+                      opacity: canPublish ? 1 : 0.45,
                     }}
                   >
                     Publish →
@@ -1557,6 +1802,12 @@ function Student({ articles, account, session, onSession }) {
   const initIds = useRef(new Set(SEED.map((a) => a.id)));
   const endRef = useRef();
 
+  useEffect(() => {
+    if (articles.length && idx >= articles.length) {
+      setIdx(articles.length - 1);
+    }
+  }, [articles.length, idx]);
+
   const art = articles[idx];
   const COLOR = PAL[idx % PAL.length];
 
@@ -1595,6 +1846,16 @@ function Student({ articles, account, session, onSession }) {
     });
   }, [msgs, cprog, doneArts, idx]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  const getArticleContext = (article) => {
+    const content = article.content?.trim();
+    if (!content) return "No article body was provided.";
+
+    const maxChars = 12000;
+    return content.length > maxChars
+      ? `${content.slice(0, maxChars)}\n\n[Article context truncated for length.]`
+      : content;
+  };
+
   const buildSystem = (a, lv, progress = {}) =>
     `You're a knowledgeable friend helping someone understand an article they just read. Your job is to teach through conversation, not to test or quiz them.
 
@@ -1606,6 +1867,9 @@ Article: "${a.title}"
 Teaching goal: ${a.goal}
 Concepts to cover: ${a.concepts.join(", ")}
 Current concept progress memory: ${JSON.stringify(progress)}
+
+Article context:
+${getArticleContext(a)}
 
 How to teach:
 - Every visible response must end with exactly one short guiding question.
@@ -1755,7 +2019,6 @@ When ALL concepts reach ≥ 0.8, still include the EVAL line, then append: DONE|
           {articles.map((a, i) => {
             const done = doneArts.includes(a.id);
             const active = i === idx;
-            const locked = !done && i > idx;
             const c = PAL[i % PAL.length];
             const isNew = !initIds.current.has(a.id);
             // article-level progress (avg of its concepts)
@@ -1773,17 +2036,15 @@ When ALL concepts reach ≥ 0.8, still include the EVAL line, then append: DONE|
                 style={{ display: "flex", alignItems: "center" }}
               >
                 <div
-                  onClick={() => {
-                    if (done || active) goTo(i);
-                  }}
+                  onClick={() => goTo(i)}
                   style={{
                     display: "flex",
                     alignItems: "center",
                     gap: 9,
                     padding: "0 16px",
                     height: "100%",
-                    opacity: locked ? 0.28 : 1,
-                    cursor: done || active ? "pointer" : "default",
+                    opacity: 1,
+                    cursor: "pointer",
                     borderBottom: active
                       ? `2px solid ${c}`
                       : "2px solid transparent",
@@ -1805,7 +2066,7 @@ When ALL concepts reach ≥ 0.8, still include the EVAL line, then append: DONE|
                         height: 24,
                         borderRadius: "50%",
                         background: done ? c + "20" : active ? c + "18" : T.dim,
-                        border: `1.5px solid ${done || active ? c : T.dim}`,
+                        border: `1.5px solid ${done || active ? c : T.border}`,
                         display: "flex",
                         alignItems: "center",
                         justifyContent: "center",
@@ -1823,7 +2084,7 @@ When ALL concepts reach ≥ 0.8, still include the EVAL line, then append: DONE|
                       style={{
                         fontSize: 12,
                         fontWeight: active ? 600 : 400,
-                        color: active ? T.text : done ? T.sub : T.dim,
+                        color: active ? T.text : T.sub,
                         whiteSpace: "nowrap",
                       }}
                     >
@@ -1853,7 +2114,9 @@ When ALL concepts reach ≥ 0.8, still include the EVAL line, then append: DONE|
                       width: 20,
                       height: 1,
                       background:
-                        i < idx ? PAL[i % PAL.length] + "55" : T.border,
+                        doneArts.includes(a.id)
+                          ? PAL[i % PAL.length] + "55"
+                          : T.border,
                       flexShrink: 0,
                     }}
                   />
@@ -1969,7 +2232,44 @@ When ALL concepts reach ≥ 0.8, still include the EVAL line, then append: DONE|
               >
                 {art.title}
               </h2>
-              {art.url && (
+              {(art.url || art.pdfName) && (
+                <div style={{ margin: "10px 0 16px" }}>
+                  {art.url ? (
+                    <a
+                      href={art.url}
+                      target="_blank"
+                      rel="noreferrer"
+                      style={{
+                        fontSize: 12,
+                        color: T.sub,
+                        display: "inline-block",
+                        textDecoration: "none",
+                        background: T.card,
+                        border: `1px solid ${T.border}`,
+                        borderRadius: 6,
+                        padding: "4px 10px",
+                      }}
+                    >
+                      Original URL: {art.url}
+                    </a>
+                  ) : (
+                    <span
+                      style={{
+                        fontSize: 12,
+                        color: T.sub,
+                        display: "inline-block",
+                        background: T.card,
+                        border: `1px solid ${T.border}`,
+                        borderRadius: 6,
+                        padding: "4px 10px",
+                      }}
+                    >
+                      Original PDF: {art.pdfName}
+                    </span>
+                  )}
+                </div>
+              )}
+              {false && art.url && (
                 <a
                   href={art.url}
                   target="_blank"
@@ -2345,38 +2645,38 @@ When ALL concepts reach ≥ 0.8, still include the EVAL line, then append: DONE|
 // ── App root ───────────────────────────────────────────────
 export default function App() {
   const [currentAccountId, setCurrentAccountId] = useState(null);
-  const [appState, setAppState] = useState(() => {
-    try {
-      const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
-      if (saved && Array.isArray(saved.accounts)) {
-        return {
-          accounts: saved.accounts,
-          articles: saved.articles || SEED,
-          sessions: saved.sessions || {},
-        };
-      }
-    } catch {
-      // Start fresh if local storage contains invalid data.
-    }
-    return { accounts: [], articles: SEED, sessions: {} };
-  });
+  const [appState, setAppState] = useState(() => sharedDb.read());
+  const appStateRef = useRef(appState);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(appState));
+    appStateRef.current = appState;
   }, [appState]);
 
   useEffect(() => {
+    let mounted = true;
+    const pullSharedState = async () => {
+      const state = await sharedDb.load();
+      if (!mounted) return;
+      setAppState(state);
+    };
+
+    pullSharedState();
+    const interval = window.setInterval(pullSharedState, SYNC_INTERVAL_MS);
+
     const syncFromStorage = (event) => {
       if (event.key !== STORAGE_KEY || !event.newValue) return;
       try {
-        const saved = JSON.parse(event.newValue);
-        if (saved && Array.isArray(saved.accounts)) setAppState(saved);
+        setAppState(sharedDb.normalize(JSON.parse(event.newValue)));
       } catch {
         // Ignore malformed storage events.
       }
     };
     window.addEventListener("storage", syncFromStorage);
-    return () => window.removeEventListener("storage", syncFromStorage);
+    return () => {
+      mounted = false;
+      window.clearInterval(interval);
+      window.removeEventListener("storage", syncFromStorage);
+    };
   }, []);
 
   const accounts = appState.accounts;
@@ -2386,44 +2686,43 @@ export default function App() {
   const students = accounts.filter((a) => a.role === "student");
 
   const setArticles = useCallback((next) => {
-    setAppState((prev) => ({
-      ...prev,
-      articles: typeof next === "function" ? next(prev.articles) : next,
-    }));
+    setAppState((prev) => {
+      const articles = typeof next === "function" ? next(prev.articles) : next;
+      const state = { ...prev, articles };
+      sharedDb.save(state);
+      return state;
+    });
   }, []);
 
   const createAccount = useCallback(({ name, role }) => {
-    const account = { id: makeId(role === "student" ? "s" : "p"), name, role };
-    setAppState((prev) => ({
-      ...prev,
-      accounts: [...prev.accounts, account],
-      sessions:
-        role === "student"
-          ? { ...prev.sessions, [account.id]: emptySession() }
-          : prev.sessions,
-    }));
+    const { account, state } = sharedDb.createAccount(
+      appStateRef.current,
+      { name, role },
+      { makeSession: role === "student" },
+    );
+    setAppState(state);
+    sharedDb.save(state);
     setCurrentAccountId(account.id);
     return account;
   }, []);
 
   const addStudent = useCallback((name) => {
-    const student = { id: makeId("s"), name, role: "student" };
-    setAppState((prev) => ({
-      ...prev,
-      accounts: [...prev.accounts, student],
-      sessions: { ...prev.sessions, [student.id]: emptySession() },
-    }));
-    return student;
+    const { account, state } = sharedDb.createAccount(
+      appStateRef.current,
+      { name, role: "student" },
+      { makeSession: true },
+    );
+    setAppState(state);
+    sharedDb.save(state);
+    return account;
   }, []);
 
   const updSession = useCallback((id, data) => {
-    setAppState((prev) => ({
-      ...prev,
-      sessions: {
-        ...prev.sessions,
-        [id]: { ...(prev.sessions[id] || emptySession()), ...data },
-      },
-    }));
+    setAppState((prev) => {
+      const state = sharedDb.updateSession(prev, id, data);
+      sharedDb.save(state);
+      return state;
+    });
   }, []);
 
   if (!currentAccount) {
